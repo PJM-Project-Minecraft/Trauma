@@ -1,7 +1,6 @@
 package ru.liko.trauma.bloodybits.entity;
 
 import ru.liko.trauma.Trauma;
-import ru.liko.trauma.bloodybits.config.ClientConfig;
 import ru.liko.trauma.bloodybits.config.CommonConfig;
 import ru.liko.trauma.bloodybits.utils.BloodyBitsUtils;
 import net.minecraft.core.BlockPos;
@@ -510,7 +509,7 @@ public class BloodSprayEntity extends Projectile {
             this.ownerName = (ownerEntity.toString().contains("Player")) ? "player" : ownerEntity.getEncodeId();
             this.isSolid = CommonConfig.solidEntities().contains(this.ownerName);
             if (this.level().isClientSide()) {
-                for (Map.Entry<String, List<String>> mapElement : ClientConfig.entityBloodColors().entrySet()) {
+                for (Map.Entry<String, List<String>> mapElement : CommonConfig.entityBloodColors().entrySet()) {
                     if (mapElement.getValue().contains(this.ownerName)) {
                         String bloodColorHexVal = mapElement.getKey();
                         this.red = HexFormat.fromHexDigits(bloodColorHexVal, 1, 3);

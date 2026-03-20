@@ -2,7 +2,7 @@ package ru.liko.trauma.bloodybits.client.model;
 
 import net.minecraft.client.Minecraft;
 import net.minecraft.resources.ResourceLocation;
-import ru.liko.trauma.bloodybits.config.ClientConfig;
+import ru.liko.trauma.bloodybits.config.CommonConfig;
 import ru.liko.trauma.bloodybits.utils.BloodyBitsUtils;
 import java.util.*;
 
@@ -47,7 +47,7 @@ public class EntityInjuries {
 
     private void addEntityDamageTexture(String namespace, String path) {
 
-        for (int i = 0; i < ClientConfig.availableTexturesPerEntity(); i++) {
+        for (int i = 0; i < CommonConfig.availableTexturesPerEntity(); i++) {
             String modifiedPath = path.concat(i + ".png");
             try {
                 ResourceLocation injuryTextureResourceLocation = ResourceLocation.fromNamespaceAndPath(namespace,

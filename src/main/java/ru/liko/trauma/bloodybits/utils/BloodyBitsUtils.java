@@ -1,7 +1,6 @@
 package ru.liko.trauma.bloodybits.utils;
 
 import ru.liko.trauma.bloodybits.client.model.EntityInjuries;
-import ru.liko.trauma.bloodybits.config.ClientConfig;
 import ru.liko.trauma.bloodybits.config.CommonConfig;
 import ru.liko.trauma.bloodybits.entity.BloodSprayEntity;
 import com.mojang.blaze3d.vertex.VertexConsumer;
@@ -62,7 +61,7 @@ public class BloodyBitsUtils {
         if (CommonConfig.solidEntities().contains(entityName)) {
             damageHexColor = "#ffffff";
         } else {
-            for (Map.Entry<String, List<String>> mapElement : ClientConfig.entityBloodColors().entrySet()) {
+            for (Map.Entry<String, List<String>> mapElement : CommonConfig.entityBloodColors().entrySet()) {
                 if (mapElement.getValue().contains(Objects.requireNonNull(entityName))) {
                     damageHexColor = mapElement.getKey();
                     break;

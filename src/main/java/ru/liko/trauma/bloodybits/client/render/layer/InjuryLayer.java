@@ -1,7 +1,7 @@
 package ru.liko.trauma.bloodybits.client.render.layer;
 
 import ru.liko.trauma.bloodybits.client.model.EntityInjuries;
-import ru.liko.trauma.bloodybits.config.ClientConfig;
+import ru.liko.trauma.bloodybits.config.CommonConfig;
 import ru.liko.trauma.bloodybits.utils.BloodyBitsUtils;
 import com.mojang.blaze3d.vertex.PoseStack;
 import com.mojang.blaze3d.vertex.VertexConsumer;
@@ -33,7 +33,7 @@ public class InjuryLayer<T extends LivingEntity, M extends EntityModel<T>> exten
     public void render(@NotNull PoseStack poseStack, @NotNull MultiBufferSource bufferSource, int pPackedLight,
             @NotNull T livingEntity, float limbSwing, float limbSwingAmount, float partialTicks, float ageInTicks,
             float netHeadYaw, float headPitch) {
-        if (ClientConfig.showEntityDamage() && livingEntity.isAlive()
+        if (CommonConfig.showEntityDamage() && livingEntity.isAlive()
                 && livingEntity.getHealth() < livingEntity.getMaxHealth()) {
             int entityId = livingEntity.getId();
 
@@ -83,7 +83,7 @@ public class InjuryLayer<T extends LivingEntity, M extends EntityModel<T>> exten
                 entityName = (entityName == null) ? "" : entityName;
                 damageHexColor = BloodyBitsUtils.getEntityDamageHexColor(entityName);
             }
-            case "burn" -> damageHexColor = ClientConfig.getBurnDamageColor();
+            case "burn" -> damageHexColor = CommonConfig.getBurnDamageColor();
         }
 
         if (damageHexColor != null && !damageHexColor.isBlank()) {

@@ -3,7 +3,6 @@ package ru.liko.trauma;
 import ru.liko.trauma.common.capability.ModAttachments;
 import ru.liko.trauma.common.effect.ModEffects;
 import ru.liko.trauma.bloodybits.config.CommonConfig;
-import ru.liko.trauma.bloodybits.config.ClientConfig;
 import ru.liko.trauma.bloodybits.registry.ModEntityTypes;
 
 import ru.liko.trauma.common.item.ModItems;
@@ -77,7 +76,6 @@ public class Trauma {
         // file for us
         modContainer.registerConfig(ModConfig.Type.COMMON, Config.SPEC);
         modContainer.registerConfig(ModConfig.Type.COMMON, CommonConfig.SPEC, "bloodybits-common.toml");
-        modContainer.registerConfig(ModConfig.Type.CLIENT, ClientConfig.SPEC, "bloodybits-client.toml");
     }
 
     private void commonSetup(final FMLCommonSetupEvent event) {
