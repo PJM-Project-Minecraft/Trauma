@@ -99,12 +99,14 @@ public class RagdollSavedData extends SavedData {
         public final UUID playerUUID;
         public final int networkRagdollId;
         public final int deathTicksRemaining;
+        public final float corpseIntegrity;
         public final RagdollTransform[] transforms;
 
-        public SavedDeathRagdoll(UUID uuid, int networkId, int ticks, RagdollTransform[] transforms) {
+        public SavedDeathRagdoll(UUID uuid, int networkId, int ticks, float corpseIntegrity, RagdollTransform[] transforms) {
             this.playerUUID = uuid;
             this.networkRagdollId = networkId;
             this.deathTicksRemaining = ticks;
+            this.corpseIntegrity = corpseIntegrity;
             this.transforms = transforms;
         }
 
@@ -113,6 +115,7 @@ public class RagdollSavedData extends SavedData {
             tag.putUUID("UUID", playerUUID);
             tag.putInt("NetworkId", networkRagdollId);
             tag.putInt("TicksRemaining", deathTicksRemaining);
+            tag.putFloat("CorpseIntegrity", corpseIntegrity);
 
             ListTag transformList = new ListTag();
             for (RagdollTransform t : transforms) {
@@ -138,6 +141,7 @@ public class RagdollSavedData extends SavedData {
             UUID uuid = tag.getUUID("UUID");
             int networkId = tag.getInt("NetworkId");
             int ticks = tag.getInt("TicksRemaining");
+            float integrity = tag.contains("CorpseIntegrity") ? tag.getFloat("CorpseIntegrity") : Float.NaN;
 
             ListTag transformList = tag.getList("Transforms", Tag.TAG_COMPOUND);
             RagdollTransform[] transforms = new RagdollTransform[transformList.size()];
@@ -150,7 +154,7 @@ public class RagdollSavedData extends SavedData {
                         tTag.getFloat("VelX"), tTag.getFloat("VelY"), tTag.getFloat("VelZ")
                 );
             }
-            return new SavedDeathRagdoll(uuid, networkId, ticks, transforms);
+            return new SavedDeathRagdoll(uuid, networkId, ticks, integrity, transforms);
         }
 
         public static SavedDeathRagdoll fromPlayerRagdoll(PlayerRagdoll ragdoll) {
@@ -158,6 +162,7 @@ public class RagdollSavedData extends SavedData {
                     ragdoll.getPlayerUUID(),
                     ragdoll.getNetworkRagdollId(),
                     ragdoll.getDeathTicksRemaining(),
+                    ragdoll.getCorpseIntegritySnapshot(),
                     ragdoll.getRagdollTransforms()
             );
         }

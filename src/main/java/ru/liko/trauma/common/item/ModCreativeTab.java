@@ -20,8 +20,6 @@ public class ModCreativeTab {
                     .displayItems((parameters, output) -> {
                         output.accept(ModItems.BANDAGE.get());
                         output.accept(ModItems.TOURNIQUET.get());
-                        output.accept(ModItems.BLOOD_BAG.get());
-                        output.accept(ModItems.SPLINT.get());
                     })
                     .build());
 }

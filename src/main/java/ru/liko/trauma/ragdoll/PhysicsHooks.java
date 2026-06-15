@@ -2,6 +2,7 @@ package ru.liko.trauma.ragdoll;
 
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.util.Mth;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.phys.Vec3;
@@ -100,6 +101,42 @@ public class PhysicsHooks {
             if (ragdoll != null) {
                 // Transition to DEATH_RAGDOLL mode (starts physics if not already active)
                 ragdoll.setMode(PlayerRagdoll.Mode.DEATH_RAGDOLL);
+
+                // Apply a knockback impulse from the killing damage source so the body
+                // reacts visibly (e.g. TACZ bullets, arrows, melee). LivingDamageEvent
+                // fires before death/mode switch, so the existing onLivingDamage hook
+                // never catches the fatal hit. We replicate that logic here using the
+                // death event's source.
+                if (Config.DEATH_RAGDOLL_REACT_TO_FORCES.get() && ragdoll.hasBodies()) {
+                    float amount = event.getSource() != null ? 4.0f : 0f; // fallback magnitude
+                    Entity srcEntity = event.getSource() != null ? event.getSource().getEntity() : null;
+                    Vec3 srcPos = null;
+                    if (srcEntity != null) {
+                        srcPos = srcEntity.position();
+                    } else if (event.getSource() != null && event.getSource().getSourcePosition() != null) {
+                        srcPos = event.getSource().getSourcePosition();
+                    }
+
+                    Vec3 torso = ragdoll.getTorsoPosition();
+                    Vec3 ragdollPos = torso != null ? torso : player.position();
+
+                    if (srcPos != null) {
+                        Vec3 dir = ragdollPos.subtract(srcPos);
+                        double len = dir.length();
+                        if (len > 1.0e-4) {
+                            dir = dir.scale(1.0 / len);
+                        } else {
+                            dir = new Vec3(0, 1, 0);
+                        }
+                        // Add a slight upward bias so the body lifts off a bit
+                        dir = new Vec3(dir.x, dir.y + 0.35, dir.z).normalize();
+                        float strength = Math.min(6.0f + amount * 0.6f, 14.0f);
+                        ragdoll.applyKnockbackImpulse(dir, strength);
+                    } else {
+                        // Directionless death (magic, suffocation, etc.) — small random tumble
+                        ragdoll.applyRandomVelocity(4f, 2f, 4f);
+                    }
+                }
             }
         }
     }
@@ -112,6 +149,11 @@ public class PhysicsHooks {
             PlayerRagdoll existing = pw.getPlayerRagdoll(sp);
             if (existing != null && existing.getMode() == PlayerRagdoll.Mode.DEATH_RAGDOLL) {
                 pw.orphanDeathRagdoll(sp.getUUID());
+            }
+            // Restore standing pose — the dead entity may have been set to SLEEPING during ragdoll
+            if (sp.getPose() != net.minecraft.world.entity.Pose.STANDING) {
+                sp.setPose(net.minecraft.world.entity.Pose.STANDING);
+                sp.refreshDimensions();
             }
             pw.addPlayer(sp);
 
@@ -258,6 +300,20 @@ public class PhysicsHooks {
             double distance = torso.distanceTo(center);
             if (distance < radius * 2.5) {
                 ragdoll.applyExplosionImpulse(center, radius);
+
+                /*
+                 Orphan corpse has no living player receiving vanilla explosion hurtEvents — chip away
+                 integrity using the same radial gate as impulses so TNT/heavy blasts shred the mesh.
+                */
+                if (ragdoll.isOrphaned() && ragdoll.getMode() == PlayerRagdoll.Mode.DEATH_RAGDOLL) {
+                    float base = Config.RAGDOLL_ORPHAN_EXPLOSION_CORPSE_DAMAGE.get().floatValue();
+                    if (base > 0f) {
+                        double span = Math.max(radius * 2.5, 1e-3);
+                        float falloff = (float) (1.0 - distance / span);
+                        falloff = Mth.clamp(falloff, 0f, 1f);
+                        ragdoll.applyCorpseIntegrityLoss(base * falloff);
+                    }
+                }
             }
         }
     }
@@ -287,17 +343,19 @@ public class PhysicsHooks {
         if (amount <= 0f)
             return;
 
-        // Determine knockback direction from damage source
+        // Knockback impulse (scaled + capped internally)
         Entity source = event.getSource().getEntity();
         if (source != null) {
             Vec3 torso = ragdoll.getTorsoPosition();
             Vec3 ragdollPos = torso != null ? torso : player.position();
             Vec3 direction = ragdollPos.subtract(source.position()).normalize();
-            ragdoll.applyKnockbackImpulse(direction, Math.min(amount * 0.5f, 10f));
+            ragdoll.applyKnockbackImpulse(direction, amount * 0.48f);
         } else {
-            // Random upward push for directionless damage
-            ragdoll.applyKnockbackImpulse(new Vec3(0, 1, 0), Math.min(amount * 0.3f, 6f));
+            ragdoll.applyKnockbackImpulse(new Vec3(0, 1, 0), amount * 0.32f);
         }
+
+        float corpseLoss = amount * Config.RAGDOLL_CORPSE_DAMAGE_FACTOR.get().floatValue();
+        ragdoll.applyCorpseIntegrityLoss(corpseLoss);
     }
 
     // ======================== SERVER SHUTDOWN ========================

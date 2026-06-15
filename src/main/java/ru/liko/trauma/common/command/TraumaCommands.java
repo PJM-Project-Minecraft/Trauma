@@ -2,6 +2,7 @@ package ru.liko.trauma.common.command;
 
 import com.mojang.brigadier.CommandDispatcher;
 import com.mojang.brigadier.arguments.FloatArgumentType;
+import com.mojang.brigadier.arguments.StringArgumentType;
 import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.commands.Commands;
 import net.minecraft.commands.arguments.EntityArgument;
@@ -12,12 +13,9 @@ import net.minecraft.world.phys.Vec3;
 import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.fml.common.EventBusSubscriber;
 import net.neoforged.neoforge.event.RegisterCommandsEvent;
+import ru.liko.trauma.Config;
 import ru.liko.trauma.Trauma;
-import ru.liko.trauma.common.capability.ModAttachments;
-import ru.liko.trauma.common.effect.ModEffects;
 import ru.liko.trauma.common.entity.MannequinEntity;
-import ru.liko.trauma.common.event.SyncEventHandler;
-import ru.liko.trauma.common.system.TraumaData;
 import ru.liko.trauma.ragdoll.PhysicsWorld;
 import ru.liko.trauma.ragdoll.PlayerRagdoll;
 import ru.liko.trauma.ragdoll.RagdollPart;
@@ -31,19 +29,22 @@ public class TraumaCommands {
         public static void onRegisterCommands(RegisterCommandsEvent event) {
                 CommandDispatcher<CommandSourceStack> dispatcher = event.getDispatcher();
 
+                // Use EntityArgument.players() so selectors like @a / @e[type=player] / @r work.
+                // It still accepts single player names and UUIDs, so /trauma heal Steve keeps working.
                 var healCmd = Commands.literal("heal")
-                        .then(Commands.argument("target", EntityArgument.player())
-                                .executes(ctx -> healPlayer(ctx.getSource(), EntityArgument.getPlayer(ctx, "target"))))
-                        .executes(ctx -> healPlayer(ctx.getSource(), ctx.getSource().getPlayerOrException()));
+                        .then(Commands.argument("targets", EntityArgument.players())
+                                .executes(ctx -> healPlayers(ctx.getSource(), EntityArgument.getPlayers(ctx, "targets"))))
+                        .executes(ctx -> healPlayers(ctx.getSource(),
+                                java.util.List.of(ctx.getSource().getPlayerOrException())));
 
                 var damageCmd = Commands.literal("damage")
                         .then(Commands.argument("amount", FloatArgumentType.floatArg(1f, 5000f))
-                                .then(Commands.argument("target", EntityArgument.player())
-                                        .executes(ctx -> damagePlayer(ctx.getSource(),
-                                                EntityArgument.getPlayer(ctx, "target"),
+                                .then(Commands.argument("targets", EntityArgument.players())
+                                        .executes(ctx -> damagePlayers(ctx.getSource(),
+                                                EntityArgument.getPlayers(ctx, "targets"),
                                                 FloatArgumentType.getFloat(ctx, "amount"))))
-                                .executes(ctx -> damagePlayer(ctx.getSource(),
-                                        ctx.getSource().getPlayerOrException(),
+                                .executes(ctx -> damagePlayers(ctx.getSource(),
+                                        java.util.List.of(ctx.getSource().getPlayerOrException()),
                                         FloatArgumentType.getFloat(ctx, "amount"))));
 
                 var debugCmd = Commands.literal("debug")
@@ -73,6 +74,14 @@ public class TraumaCommands {
                         .then(ragdollMannequin)
                         .then(ragdollImpulse);
 
+                var hudInfo = Commands.literal("hud-info")
+                        .executes(ctx -> printHudInfo(ctx.getSource()));
+
+                var hudSet = Commands.literal("hud-set")
+                        .then(Commands.argument("preset", StringArgumentType.word())
+                                .executes(ctx -> setHudPreset(ctx.getSource(),
+                                        StringArgumentType.getString(ctx, "preset"))));
+
                 dispatcher.register(
                         Commands.literal("trauma")
                                 .requires(source -> source.hasPermission(2))
@@ -80,19 +89,66 @@ public class TraumaCommands {
                                 .then(damageCmd)
                                 .then(debugCmd)
                                 .then(ragdollCmd)
+                                .then(hudInfo)
+                                .then(hudSet)
                 );
         }
 
-        private static int healPlayer(CommandSourceStack source, ServerPlayer target) {
-                TraumaData data = target.getData(ModAttachments.TRAUMA_DATA);
-                target.setData(ModAttachments.TRAUMA_DATA,
-                                data.withBlood(TraumaData.MAX_BLOOD).withBleedStrength(0)
-                                        .withLegFracture(0).withSplint(false).withLegDislocation(0));
-                target.removeEffect(
-                                net.minecraft.core.registries.BuiltInRegistries.MOB_EFFECT
-                                                .wrapAsHolder(ModEffects.BLEEDING.get()));
+        private static int printHudInfo(CommandSourceStack source) {
+                Config.HudPresentation fromConfig = Config.HUD_PRESENTATION.get();
+                Config.HudPresentation override = Config.getRuntimeHudOverride();
+                Config.HudPresentation effective = Config.effectiveHudPresentation();
+                Config.MedicalDifficulty diff = Config.MEDICAL_DIFFICULTY.get();
+                Config.GuiPosition hudPos = Config.HUD_GUI_POSITION.get();
 
-                // Remove max health penalty immediately so setHealth sets to full 20
+                source.sendSystemMessage(Component.literal("§6[Trauma HUD diagnostics]"));
+                source.sendSystemMessage(Component.literal("§7  HUD_PRESENTATION (TOML): §f" + fromConfig));
+                source.sendSystemMessage(Component.literal("§7  Runtime override:       §f"
+                                + (override == null ? "<none>" : override.toString())));
+                source.sendSystemMessage(Component.literal("§7  Effective:              §a" + effective));
+                source.sendSystemMessage(Component.literal("§7  MEDICAL_DIFFICULTY:     §f" + diff));
+                source.sendSystemMessage(Component.literal("§7  HUD_GUI_POSITION:       §f" + hudPos));
+                source.sendSystemMessage(Component.literal(
+                                "§8 Use §f/trauma hud-set <auto|minimal|full>§8 to override at runtime."));
+                return 1;
+        }
+
+        private static int setHudPreset(CommandSourceStack source, String preset) {
+                Config.HudPresentation chosen;
+                try {
+                        chosen = Config.HudPresentation.valueOf(preset.toUpperCase(java.util.Locale.ROOT));
+                } catch (IllegalArgumentException ex) {
+                        source.sendFailure(Component.literal(
+                                        "§cUnknown preset '" + preset + "'. Valid: auto | minimal | full"));
+                        return 0;
+                }
+                Config.setRuntimeHudOverride(chosen);
+                source.sendSuccess(() -> Component.literal(
+                                "§aHUD preset set to §f" + chosen + "§a (runtime override, not saved to config)."), true);
+                return 1;
+        }
+
+        private static int healPlayers(CommandSourceStack source, java.util.Collection<ServerPlayer> targets) {
+                int count = 0;
+                for (ServerPlayer target : targets) {
+                        healSingle(target);
+                        count++;
+                }
+
+                final int healed = count;
+                if (healed == 1) {
+                        ServerPlayer only = targets.iterator().next();
+                        source.sendSuccess(
+                                        () -> Component.translatable("commands.trauma.heal.success", only.getDisplayName()),
+                                        true);
+                } else {
+                        source.sendSuccess(() -> Component.literal(
+                                        "§a[Trauma] healed §f" + healed + "§a player(s)"), true);
+                }
+                return healed;
+        }
+
+        private static void healSingle(ServerPlayer target) {
                 net.minecraft.world.entity.ai.attributes.AttributeInstance maxHealthAttr = target
                                 .getAttribute(net.minecraft.world.entity.ai.attributes.Attributes.MAX_HEALTH);
                 if (maxHealthAttr != null) {
@@ -102,23 +158,30 @@ public class TraumaCommands {
 
                 target.setHealth(target.getMaxHealth());
                 target.getFoodData().setFoodLevel(20);
-                SyncEventHandler.syncData(target);
-
-                source.sendSuccess(
-                                () -> Component.translatable("commands.trauma.heal.success", target.getDisplayName()),
-                                true);
-                return 1;
         }
 
-        private static int damagePlayer(CommandSourceStack source, ServerPlayer target, float amount) {
-                TraumaData data = target.getData(ModAttachments.TRAUMA_DATA);
-                target.setData(ModAttachments.TRAUMA_DATA, data.withBlood(data.bloodVolume() - amount));
+        private static int damagePlayers(CommandSourceStack source, java.util.Collection<ServerPlayer> targets,
+                        float amount) {
+                int count = 0;
+                float dmg = Math.min(amount, 500f);
+                for (ServerPlayer target : targets) {
+                        target.hurt(target.damageSources().magic(), dmg);
+                        count++;
+                }
 
-                source.sendSuccess(
-                                () -> Component.translatable("commands.trauma.damage.success", amount,
-                                                target.getDisplayName()),
-                                true);
-                return 1;
+                final int hit = count;
+                if (hit == 1) {
+                        ServerPlayer only = targets.iterator().next();
+                        source.sendSuccess(
+                                        () -> Component.translatable("commands.trauma.damage.success", dmg,
+                                                        only.getDisplayName()),
+                                        true);
+                } else {
+                        source.sendSuccess(() -> Component.literal(
+                                        "§e[Trauma] applied §f" + dmg + "§e magic damage to §f" + hit + "§e player(s)"),
+                                        true);
+                }
+                return hit;
         }
 
         private static int toggleDebug(CommandSourceStack source) {

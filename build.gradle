@@ -117,9 +117,6 @@ configurations {
 dependencies {
 implementation "software.bernie.geckolib:geckolib-neoforge-${minecraft_version}:${geckolib_version}"
 
-// TaCZ API (Optional)
-compileOnly files('libs/tacz-neoforge-1.21.1-1.1.7-hotfix-r1.jar')
-
 // JBullet physics (Java port of Bullet Physics) — same as prototype-physics
 implementation 'cz.advel.jbullet:jbullet:20101010-1'
 includedLibs 'cz.advel.jbullet:jbullet:20101010-1'

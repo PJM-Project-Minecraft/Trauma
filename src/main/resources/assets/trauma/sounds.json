@@ -14,30 +14,5 @@
                 "stream": false
             }
         ]
-    },
-    "body_explosion": {
-        "sounds": [
-            {
-                "name": "trauma:body_explosion_0",
-                "stream": false
-            },
-            {
-                "name": "trauma:body_explosion_1",
-                "stream": false
-            }
-        ]
-    },
-    "broken_bone": {
-        "sounds": [
-            {
-                "name": "trauma:bone-break1"
-            },
-            {
-                "name": "trauma:bone-break2"
-            },
-            {
-                "name": "trauma:bone-break3"
-            }
-        ]
     }
 }

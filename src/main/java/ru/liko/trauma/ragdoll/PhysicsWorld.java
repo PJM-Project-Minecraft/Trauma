@@ -82,9 +82,17 @@ public class PhysicsWorld {
         dynamicsWorld.getSolverInfo().numIterations = 20;
     }
 
-    /** Step the physics simulation. Called once per server tick. */
+    /**
+     * Step the physics simulation. Called once per server tick.
+     * <p>
+     * Profile hotspots during ragdoll load (Spark/JFR/async-profiler sample mode):
+     * {@link DiscreteDynamicsWorld#stepSimulation(float, int, float)} (Bullet),
+     * {@link PlayerRagdoll#afterStep()} → {@link PlayerRagdoll#rebuildLocalStaticBlockCollision},
+     * {@link PlayerRagdoll#syncEntityXYZToTorsoIfNeeded}, {@link PlayerRagdoll#correctInterpenetrations}.
+     */
     public void step(float dt) {
-        dynamicsWorld.stepSimulation(dt, 30, 1f / 120f);
+        // 4 sub-steps at 1/60 s each: deterministic, smooth, low overhead.
+        dynamicsWorld.stepSimulation(dt, 4, 1f / 60f);
 
         for (PlayerRagdoll pr : playerRagdolls.values()) {
             pr.afterStep();
@@ -229,10 +237,11 @@ public class PhysicsWorld {
             var entry = it.next();
             PlayerRagdoll pr = entry.getValue();
 
-            // Death ragdolls whose player is gone should be orphaned, not destroyed
+            // Death ragdolls whose игрок исчез, ушёл в другое измерение или уже респавнулся
+            // живым в этом же измерении — отвязываем труп, иначе ragdoll навечно привязан к UUID.
             if (pr.getMode() == PlayerRagdoll.Mode.DEATH_RAGDOLL) {
                 ServerPlayer player = pr.getPlayer();
-                if (player == null || player.serverLevel() != this.level) {
+                if (player == null || player.serverLevel() != this.level || !player.isDeadOrDying()) {
                     pr.setOrphaned(true);
 
                     int oldId = pr.getNetworkRagdollId();
@@ -306,7 +315,7 @@ public class PhysicsWorld {
             int freshId = nextVirtualRagdollId--;
             PlayerRagdoll ragdoll = PlayerRagdoll.createFromSavedData(
                     this, saved.playerUUID, freshId,
-                    saved.deathTicksRemaining, saved.transforms);
+                    saved.deathTicksRemaining, saved.transforms, saved.corpseIntegrity);
             orphanedDeathRagdolls.add(ragdoll);
 
             // Notify all players in this dimension

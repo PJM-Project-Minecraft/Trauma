@@ -21,14 +21,4 @@ public class ModSounds {
                         () -> SoundEvent
                                         .createVariableRangeEvent(ResourceLocation.fromNamespaceAndPath(Trauma.MODID,
                                                         "heartbeat_out")));
-
-        public static final Supplier<SoundEvent> BLOOD_SPATTER = SOUNDS.register("blood_spatter",
-                        () -> SoundEvent
-                                        .createVariableRangeEvent(ResourceLocation.fromNamespaceAndPath(Trauma.MODID,
-                                                        "blood_spatter")));
-
-        public static final Supplier<SoundEvent> BROKEN_BONE = SOUNDS.register("broken_bone",
-                        () -> SoundEvent
-                                        .createVariableRangeEvent(ResourceLocation.fromNamespaceAndPath(Trauma.MODID,
-                                                        "broken_bone")));
 }

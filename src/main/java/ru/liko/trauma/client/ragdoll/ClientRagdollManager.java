@@ -41,18 +41,39 @@ public class ClientRagdollManager {
     }
 
     /**
-     * Try to resolve skin texture from a player UUID by looking in the level's
-     * player list. If the player entity is loaded, cache its skin texture now.
+     * Resolve a player's skin texture from a UUID via the network's
+     * {@link net.minecraft.client.multiplayer.PlayerInfo}.
+     * <p>
+     * PlayerInfo persists for every connected player regardless of whether their
+     * entity is currently within view distance, so this lookup succeeds even when
+     * the player is too far to be tracked by the client world (which is the
+     * common case for a death ragdoll viewed by a distant killer).
      */
-    private static void tryResolveSkinFromUUID(ClientRagdoll rag, UUID uuid) {
+    @Nullable
+    public static ResourceLocation resolveSkinFromUUID(UUID uuid) {
+        if (uuid == null) return null;
         Minecraft mc = Minecraft.getInstance();
-        if (mc.level == null) return;
-        for (net.minecraft.world.entity.player.Player p : mc.level.players()) {
-            if (p.getUUID().equals(uuid) && p instanceof net.minecraft.client.player.AbstractClientPlayer acp) {
-                rag.cacheSkinTexture(acp.getSkin().texture());
-                return;
+        net.minecraft.client.multiplayer.ClientPacketListener conn = mc.getConnection();
+        if (conn != null) {
+            net.minecraft.client.multiplayer.PlayerInfo info = conn.getPlayerInfo(uuid);
+            if (info != null) {
+                return info.getSkin().texture();
             }
         }
+        // Fallback: scan loaded entities (only works when the player is in view distance)
+        if (mc.level != null) {
+            for (net.minecraft.world.entity.player.Player p : mc.level.players()) {
+                if (p.getUUID().equals(uuid) && p instanceof net.minecraft.client.player.AbstractClientPlayer acp) {
+                    return acp.getSkin().texture();
+                }
+            }
+        }
+        return null;
+    }
+
+    private static void tryResolveSkinFromUUID(ClientRagdoll rag, UUID uuid) {
+        ResourceLocation skin = resolveSkinFromUUID(uuid);
+        if (skin != null) rag.cacheSkinTexture(skin);
     }
 
     public static void remove(int playerEntityId) {
@@ -121,8 +142,25 @@ public class ClientRagdollManager {
         public final int playerEntityId;
         public final int ragdollId;
 
-        private final RagdollTransform[] last = new RagdollTransform[6];
-        private final RagdollTransform[] current = new RagdollTransform[6];
+        // ---------------------------------------------------------------
+        // Delay-based snapshot buffer.
+        //
+        // The server runs physics and sends transforms every tick (~50 ms).
+        // Instead of interpolating from "last received" to "current received"
+        // using adaptive client-side timing (which differs per client), we
+        // store a ring-buffer of (serverTime, transforms) snapshots and
+        // always display the state at a fixed lag behind the latest snapshot.
+        //
+        // Result: every client renders the SAME server timestamp, so all
+        // observers see identical positions regardless of their network delay.
+        // ---------------------------------------------------------------
+        private static final int  BUFFER_SIZE      = 12;  // ~600 ms history at 20 TPS
+        private static final long DISPLAY_DELAY_MS = 160; // ~3 ticks behind latest — absorbs jitter
+
+        private final long[][]           bufferTimes  = new long[BUFFER_SIZE][1];
+        private final RagdollTransform[][] bufferFrames = new RagdollTransform[BUFFER_SIZE][6];
+        private int  bufWriteIdx  = 0;
+        private int  bufCount     = 0;
 
         // Cached skin texture for rendering after entity removal (death ragdoll orphaning)
         private ResourceLocation cachedSkinTexture = null;
@@ -131,10 +169,8 @@ public class ClientRagdollManager {
         @Nullable
         private UUID cachedPlayerUUID = null;
 
-        // Time-based interpolation state (client system time)
-        private long lastReceiveMs = 0;
+        // Last client-side receive time — used only for stale-detection
         private long receiveMs = 0;
-        private float smoothTickInterval = 50f; // ms, initial guess = 1 server tick (20 TPS)
 
         // Blend-in state: smooth transition when ragdoll first activates
         private long startTimeMs = 0;
@@ -148,75 +184,132 @@ public class ClientRagdollManager {
         }
 
         public void pushUpdate(RagdollTransform[] transforms, long serverTime) {
-            // Shift current -> last
-            System.arraycopy(current, 0, last, 0, 6);
+            // Build a full 6-part frame, carrying forward missing parts from the previous frame
+            RagdollTransform[] frame = new RagdollTransform[6];
+            if (bufCount > 0) {
+                int prevIdx = (bufWriteIdx - 1 + BUFFER_SIZE) % BUFFER_SIZE;
+                System.arraycopy(bufferFrames[prevIdx], 0, frame, 0, 6);
+            }
             for (RagdollTransform t : transforms) {
                 if (t == null) continue;
                 int idx = t.partId;
-                if (idx >= 0 && idx < 6) current[idx] = t;
+                if (idx >= 0 && idx < 6) frame[idx] = t;
             }
 
-            // Track receive times for time-based interpolation
-            lastReceiveMs = receiveMs;
+            bufferTimes[bufWriteIdx][0]  = serverTime;
+            bufferFrames[bufWriteIdx]    = frame;
+            bufWriteIdx  = (bufWriteIdx + 1) % BUFFER_SIZE;
+            bufCount     = Math.min(bufCount + 1, BUFFER_SIZE);
+
             receiveMs = System.currentTimeMillis();
 
-            // Smooth the tick interval estimate using exponential moving average
-            if (lastReceiveMs > 0) {
-                long rawInterval = receiveMs - lastReceiveMs;
-                if (rawInterval > 0 && rawInterval < 500) { // sanity: ignore huge gaps
-                    smoothTickInterval = smoothTickInterval * 0.8f + rawInterval * 0.2f;
-                }
-            }
-
-            // Store initial transforms for blend-in on first update
+            // Capture initial transforms for blend-in on the very first update
             if (startTimeMs == 0) {
-                startTimeMs = System.currentTimeMillis();
+                startTimeMs      = receiveMs;
                 initialTransforms = new RagdollTransform[6];
-                System.arraycopy(current, 0, initialTransforms, 0, 6);
+                System.arraycopy(frame, 0, initialTransforms, 0, 6);
             }
         }
 
         /**
-         * Get interpolated transform for a body part.
-         * Uses time-based interpolation between server snapshots with extrapolation support.
-         * @param partialTicks ignored — interpolation is now time-based
+         * Return the interpolated transform for {@code part} at the delay-adjusted
+         * display time. All clients compute the same target server-timestamp, so the
+         * rendered position is identical across observers regardless of their ping.
+         *
+         * <p>Position uses a <b>Cubic Hermite spline</b> with the stored velocity as
+         * tangent, giving smooth curved trajectories instead of piecewise linear
+         * motion. Rotation still uses slerp (quaternion spherical-linear).
+         *
+         * <p>When the target time is ahead of the latest snapshot (packet loss),
+         * the method <b>extrapolates</b> using the last known velocity for up to
+         * 200 ms to hide the stutter.
          */
         @Nullable
         public RagdollTransform getPartInterpolated(RagdollPart part, float partialTicks) {
-            int idx = part.index;
-            RagdollTransform prev = last[idx];
-            RagdollTransform cur = current[idx];
-            if (cur == null && prev == null) return null;
-            if (prev == null) return applyBlend(cur, idx);
-            if (cur == null) return applyBlend(prev, idx);
+            if (bufCount == 0) return null;
 
-            float a = computeAlpha();
-            float clampedA = Math.min(a, 1.0f);
+            int latestIdx  = (bufWriteIdx - 1 + BUFFER_SIZE) % BUFFER_SIZE;
+            long latestTime = bufferTimes[latestIdx][0];
+            long targetTime = latestTime - DISPLAY_DELAY_MS;
 
-            // Interpolate position
-            float x, y, z;
-            if (a > 1.0f && cur.velocity != null) {
-                // Extrapolate using velocity when packet is late
-                float extraSec = (a - 1.0f) * smoothTickInterval / 1000f;
-                x = cur.position.x + cur.velocity.x * extraSec;
-                y = cur.position.y + cur.velocity.y * extraSec;
-                z = cur.position.z + cur.velocity.z * extraSec;
-            } else {
-                x = lerp(prev.position.x, cur.position.x, a);
-                y = lerp(prev.position.y, cur.position.y, a);
-                z = lerp(prev.position.z, cur.position.z, a);
+            // Walk buffer newest → oldest to find frames that bracket targetTime.
+            int afterIdx  = -1; // first frame with serverTime >= targetTime
+            int beforeIdx = -1; // last  frame with serverTime <= targetTime
+            for (int i = 0; i < bufCount; i++) {
+                int idx = (bufWriteIdx - 1 - i + BUFFER_SIZE * 2) % BUFFER_SIZE;
+                long t  = bufferTimes[idx][0];
+                if (t >= targetTime) afterIdx  = idx;
+                if (t <= targetTime) { beforeIdx = idx; break; }
             }
 
-            // Slerp rotation (no extrapolation for rotation — use clamped alpha)
-            float[] q = slerp(
-                    prev.rotation.x, prev.rotation.y, prev.rotation.z, prev.rotation.w,
-                    cur.rotation.x, cur.rotation.y, cur.rotation.z, cur.rotation.w,
-                    clampedA
-            );
+            int partIdx = part.index;
+            RagdollTransform result;
 
-            RagdollTransform result = new RagdollTransform(idx, x, y, z, q[0], q[1], q[2], q[3],
-                    cur.velocity.x, cur.velocity.y, cur.velocity.z);
-            return applyBlend(result, idx);
+            if (beforeIdx == -1 && afterIdx == -1) {
+                return null;
+            } else if (beforeIdx == -1) {
+                // Target is before all stored frames — show oldest available
+                result = bufferFrames[afterIdx][partIdx];
+            } else if (afterIdx == -1 || afterIdx == beforeIdx) {
+                // Target is at or past the latest snapshot.
+                // Extrapolate using velocity to hide packet loss (max 200 ms).
+                RagdollTransform latest = bufferFrames[latestIdx][partIdx];
+                if (latest == null) return null;
+                float extraSec = Math.min((targetTime - latestTime) / 1000f, 0.2f);
+                if (extraSec > 0f) {
+                    result = new RagdollTransform(partIdx,
+                            latest.position.x + latest.velocity.x * extraSec,
+                            latest.position.y + latest.velocity.y * extraSec,
+                            latest.position.z + latest.velocity.z * extraSec,
+                            latest.rotation.x, latest.rotation.y,
+                            latest.rotation.z, latest.rotation.w,
+                            latest.velocity.x, latest.velocity.y, latest.velocity.z);
+                } else {
+                    result = latest;
+                }
+            } else {
+                // Cubic Hermite interpolation between beforeIdx and afterIdx.
+                RagdollTransform before = bufferFrames[beforeIdx][partIdx];
+                RagdollTransform after  = bufferFrames[afterIdx][partIdx];
+                if (before == null && after == null) return null;
+                if (before == null) { result = after; }
+                else if (after == null) { result = before; }
+                else {
+                    long tBefore = bufferTimes[beforeIdx][0];
+                    long tAfter  = bufferTimes[afterIdx][0];
+                    float alpha = (tAfter == tBefore) ? 1f
+                            : (float) (targetTime - tBefore) / (float) (tAfter - tBefore);
+                    alpha = Math.max(0f, Math.min(1f, alpha));
+
+                    // dt (seconds) scales the velocity tangents to match position units
+                    float dtSec = (tAfter - tBefore) / 1000f;
+
+                    // Hermite basis functions
+                    float a2  = alpha * alpha;
+                    float a3  = a2 * alpha;
+                    float h00 =  2f * a3 - 3f * a2 + 1f;
+                    float h10 =       a3 - 2f * a2 + alpha;
+                    float h01 = -2f * a3 + 3f * a2;
+                    float h11 =       a3 -       a2;
+
+                    // Tangents = velocity × dt (Catmull-Rom style)
+                    float m0x = before.velocity.x * dtSec, m0y = before.velocity.y * dtSec, m0z = before.velocity.z * dtSec;
+                    float m1x = after.velocity.x  * dtSec, m1y = after.velocity.y  * dtSec, m1z = after.velocity.z  * dtSec;
+
+                    float x = h00 * before.position.x + h10 * m0x + h01 * after.position.x + h11 * m1x;
+                    float y = h00 * before.position.y + h10 * m0y + h01 * after.position.y + h11 * m1y;
+                    float z = h00 * before.position.z + h10 * m0z + h01 * after.position.z + h11 * m1z;
+
+                    float[] q = slerp(
+                            before.rotation.x, before.rotation.y, before.rotation.z, before.rotation.w,
+                            after.rotation.x,  after.rotation.y,  after.rotation.z,  after.rotation.w,
+                            alpha);
+                    result = new RagdollTransform(partIdx, x, y, z, q[0], q[1], q[2], q[3],
+                            after.velocity.x, after.velocity.y, after.velocity.z);
+                }
+            }
+
+            return applyBlend(result, partIdx);
         }
 
         public Map<RagdollPart, RagdollTransform> getAllPartsInterpolated(float partialTicks) {
@@ -227,11 +320,29 @@ public class ClientRagdollManager {
             return map;
         }
 
+        /**
+         * Maximum time in milliseconds without receiving an update before a ragdoll
+         * is considered stale and treated as inactive. This acts as a safety net for
+         * cases where a RagdollEndPayload is missed (e.g. dimension change race).
+         * Server sends updates every tick (~50 ms), so 5 seconds = ~100 missed ticks.
+         */
+        private static final long STALE_TIMEOUT_MS = 5_000L;
+
         public boolean isActive() {
-            for (RagdollTransform t : current) {
+            if (receiveMs > 0 && System.currentTimeMillis() - receiveMs > STALE_TIMEOUT_MS) {
+                return false;
+            }
+            if (bufCount == 0) return false;
+            int latestIdx = (bufWriteIdx - 1 + BUFFER_SIZE) % BUFFER_SIZE;
+            for (RagdollTransform t : bufferFrames[latestIdx]) {
                 if (t != null) return true;
             }
             return false;
+        }
+
+        /** Returns true if this ragdoll has ever received a server update (not freshly created). */
+        public boolean hasReceivedUpdate() {
+            return receiveMs > 0;
         }
 
         /** Cache the player's skin texture so we can render after entity removal. */
@@ -254,19 +365,6 @@ public class ClientRagdollManager {
         @Nullable
         public UUID getCachedPlayerUUID() {
             return cachedPlayerUUID;
-        }
-
-        // --- Time-based interpolation ---
-
-        /**
-         * Compute interpolation alpha based on elapsed time since last server update.
-         * alpha=0 at receive time, alpha=1 at next expected update, alpha>1 if packet is late.
-         */
-        private float computeAlpha() {
-            long now = System.currentTimeMillis();
-            float elapsed = (float) (now - receiveMs);
-            float interval = Math.max(smoothTickInterval, 10f); // min 10ms safety
-            return Math.max(0f, Math.min(1.3f, elapsed / interval)); // allow 30% extrapolation
         }
 
         // --- Blend-in support ---
@@ -311,7 +409,6 @@ public class ClientRagdollManager {
 
         private float[] slerp(float x1, float y1, float z1, float w1,
                               float x2, float y2, float z2, float w2, float t) {
-            // Normalize
             float mag1 = (float) Math.sqrt(x1 * x1 + y1 * y1 + z1 * z1 + w1 * w1);
             float mag2 = (float) Math.sqrt(x2 * x2 + y2 * y2 + z2 * z2 + w2 * w2);
             if (mag1 < 0.0001f || mag2 < 0.0001f) return new float[]{x2, y2, z2, w2};
@@ -324,7 +421,6 @@ public class ClientRagdollManager {
             }
 
             if (dot > 0.9995f) {
-                // Linear fallback for nearly identical quaternions
                 float rx = x1 + t * (x2 - x1);
                 float ry = y1 + t * (y2 - y1);
                 float rz = z1 + t * (z2 - z1);
@@ -335,8 +431,8 @@ public class ClientRagdollManager {
             }
 
             double theta0 = Math.acos(dot);
-            double theta = theta0 * t;
-            double sinTheta = Math.sin(theta);
+            double theta  = theta0 * t;
+            double sinTheta  = Math.sin(theta);
             double sinTheta0 = Math.sin(theta0);
 
             float s0 = (float) (Math.cos(theta) - dot * sinTheta / sinTheta0);

@@ -40,8 +40,6 @@ public class CommonConfig {
     private static final HashMap<String, List<String>> DEFAULT_ENTITY_BLOOD_COLORS = new HashMap<>();
     private static HashMap<String, List<String>> ENTITY_BLOOD_COLORS;
 
-    private static final String BURN_DAMAGE_COLOR = "#323232";
-
     public static final ModConfigSpec.Builder BUILDER = new ModConfigSpec.Builder();
 
     private static ModConfigSpec.BooleanValue BLEED_WHEN_DAMAGED;
@@ -53,11 +51,6 @@ public class CommonConfig {
     private static ModConfigSpec.ConfigValue<List<? extends String>> SOLID_ENTITIES;
     private static ModConfigSpec.ConfigValue<List<? extends String>> BLACKLIST_ENTITIES;
     private static ModConfigSpec.ConfigValue<List<? extends String>> BLACKLIST_DAMAGE_SOURCES;
-    private static ModConfigSpec.ConfigValue<List<? extends String>> BURN_DAMAGE_SOURCE;
-    private static ModConfigSpec.ConfigValue<List<? extends String>> BLACKLIST_INJURY_SOURCES;
-
-    private static ModConfigSpec.BooleanValue SHOW_MOB_DAMAGE;
-    private static ModConfigSpec.IntValue AVAILABLE_TEXTURES_PER_ENTITY;
 
     public static boolean bleedWhenDamaged() {
         return BLEED_WHEN_DAMAGED.get();
@@ -91,28 +84,8 @@ public class CommonConfig {
         return BLACKLIST_DAMAGE_SOURCES.get();
     }
 
-    public static boolean showEntityDamage() {
-        return SHOW_MOB_DAMAGE.get();
-    }
-
-    public static int availableTexturesPerEntity() {
-        return AVAILABLE_TEXTURES_PER_ENTITY.get();
-    }
-
     public static HashMap<String, List<String>> entityBloodColors() {
         return ENTITY_BLOOD_COLORS;
-    }
-
-    public static List<? extends String> burnDamageSources() {
-        return BURN_DAMAGE_SOURCE.get();
-    }
-
-    public static List<? extends String> blackListInjurySources() {
-        return BLACKLIST_INJURY_SOURCES.get();
-    }
-
-    public static String getBurnDamageColor() {
-        return BURN_DAMAGE_COLOR;
     }
 
     static {
@@ -150,29 +123,6 @@ public class CommonConfig {
                                 "lava"),
                         it -> it instanceof String);
 
-        SHOW_MOB_DAMAGE = BUILDER.comment("Whether or not an entity should show injury textures when damaged.")
-                .define("show_entity_damage", false);
-
-        AVAILABLE_TEXTURES_PER_ENTITY = BUILDER
-                .comment("The maximum amount of available injury textures permitted per entity.\n" +
-                        "Resource packs can be created to add additional textures for entities, override existing textures, or to\n"
-                        +
-                        "even create textures for entities that have none (only applies when show_entity_damage is true).")
-                .defineInRange("available_textures_per_entity", 25, 0, 100);
-
-        BURN_DAMAGE_SOURCE = BUILDER.comment(
-                "List of the damage sources that will display burn damage for the entities (only applies when show_entity_damage is true).")
-                .defineListAllowEmpty("burn_damage_sources",
-                        List.of("burn", "fireball", "fireworks", "lava", "hotFloor", "onFire", "inFire",
-                                "lightningBolt"),
-                        it -> it instanceof String);
-
-        BLACKLIST_INJURY_SOURCES = BUILDER.comment(
-                "List of the damage sources that will not display texture damage to the entity (only applies when show_entity_damage is true).")
-                .defineListAllowEmpty("blacklist_injury_sources",
-                        List.of("drown", "starve", "dryOut", "freeze", "fellOutOfWorld"),
-                        it -> it instanceof String);
-
         BUILDER.pop();
 
         ENTITY_BLOOD_COLORS = getConfigData();
@@ -184,9 +134,6 @@ public class CommonConfig {
 
         if (!configFile.exists()) {
             try {
-                // Populates the default entity blood colors map. This is what will be populated
-                // by default in the
-                // entity_blood_colors.json file.
                 DEFAULT_ENTITY_BLOOD_COLORS.put(BLOOD_BLACK, BLOOD_BLACK_ENTITIES);
                 DEFAULT_ENTITY_BLOOD_COLORS.put(BLOOD_BLUE, BLOOD_BLUE_ENTITIES);
                 DEFAULT_ENTITY_BLOOD_COLORS.put(BLOOD_GREEN, BLOOD_GREEN_ENTITIES);
@@ -196,8 +143,7 @@ public class CommonConfig {
                 FileUtils.write(configFile, GSON.toJson(CommonConfig.DEFAULT_ENTITY_BLOOD_COLORS),
                         Charset.defaultCharset());
             } catch (IOException e) {
-                // BloodyBitsMod.LOGGER.error("Bloody Bits color config file could not be
-                // written.");
+                // ignore
             }
         }
 
@@ -216,7 +162,6 @@ public class CommonConfig {
 
     private static HashMap<String, List<String>> getConfigData() {
         File configDir = getConfigDirectory();
-        // Ensure folder exists
         if (!configDir.exists()) {
             configDir.mkdirs();
         }

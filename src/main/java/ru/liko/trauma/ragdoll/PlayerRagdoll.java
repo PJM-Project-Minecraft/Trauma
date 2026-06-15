@@ -38,7 +38,10 @@ import java.util.List;
 import java.util.UUID;
 import java.util.function.Function;
 
+import javax.annotation.Nullable;
+
 import ru.liko.trauma.Config;
+import ru.liko.trauma.common.event.DamageEventHandler;
 
 /**
  * Server-side ragdoll physics for a single player.
@@ -63,12 +66,25 @@ public class PlayerRagdoll {
     // Static collision bodies from nearby blocks
     private final List<CollisionObject> localStaticCollision = new ArrayList<>();
     private BlockPos lastCollisionCenter = BlockPos.ZERO;
+    private long lastCollisionRebuildGameTick = -1;
+
+    /** Throttled entity↔torso teleport in RAGDOLL / DEATH_ENTITY_STATE ({@link Double#NaN} = no prior sample). */
+    private double lastEntityTorsoSyncX = Double.NaN;
+    private double lastEntityTorsoSyncY = Double.NaN;
+    private double lastEntityTorsoSyncZ = Double.NaN;
 
     private int networkRagdollId;
 
     // Death ragdoll state
     private int deathTicksRemaining = -1;
     private boolean orphaned = false; // true when player logged out/respawned but ragdoll persists
+
+    /**
+     * Structural HP of physics corpse (death mode). When ≤0 the mesh is removed early without
+     * waiting for the countdown timer.
+     */
+    private float corpseIntegrity = -1f;
+    private int corpseBloodDripCounter;
 
     public PlayerRagdoll(ServerPlayer player, PhysicsWorld physicsWorld) {
         this.playerUUID = player.getUUID();
@@ -93,11 +109,14 @@ public class PlayerRagdoll {
      */
     public static PlayerRagdoll createFromSavedData(
             PhysicsWorld physicsWorld, UUID uuid, int networkRagdollId,
-            int deathTicksRemaining, RagdollTransform[] transforms) {
+            int deathTicksRemaining, RagdollTransform[] transforms, float corpseIntegritySaved) {
         PlayerRagdoll ragdoll = new PlayerRagdoll(physicsWorld, uuid, networkRagdollId);
         ragdoll.mode = Mode.DEATH_RAGDOLL;
         ragdoll.orphaned = true;
         ragdoll.deathTicksRemaining = deathTicksRemaining;
+        float maxIntegrity = (float) Config.DEATH_CORPSE_INTEGRITY.get().doubleValue();
+        ragdoll.corpseIntegrity = Float.isFinite(corpseIntegritySaved) && corpseIntegritySaved > 0f
+                ? Math.min(corpseIntegritySaved, maxIntegrity * 2f) : maxIntegrity;
         ragdoll.createRagdollBodiesFromTransforms(transforms);
         return ragdoll;
     }
@@ -142,6 +161,42 @@ public class PlayerRagdoll {
         return deathTicksRemaining;
     }
 
+    /** For persistence; valid only in {@link Mode#DEATH_RAGDOLL}. */
+    public float getCorpseIntegritySnapshot() {
+        return mode == Mode.DEATH_RAGDOLL ? corpseIntegrity : -1f;
+    }
+
+    /**
+     * Apply damage to corpse integrity. When health falls to 0 the physics mesh is dissolved.
+     *
+     * @return {@code true} if corpse was destroyed this call
+     */
+    public boolean applyCorpseIntegrityLoss(float amount) {
+        if (mode != Mode.DEATH_RAGDOLL || ragdollParts.isEmpty() || corpseIntegrity <= 0f)
+            return false;
+        if (amount <= 0f)
+            return false;
+        corpseIntegrity -= amount;
+        if (corpseIntegrity <= 0f) {
+            dissolveDeathCorpse();
+            return true;
+        }
+        return false;
+    }
+
+    /** Remove corpse immediately — same outward effect as duration timer expiry or integrity depleted. */
+    private void dissolveDeathCorpse() {
+        endDeathCorpseSession();
+    }
+
+    private void endDeathCorpseSession() {
+        cleanupBodiesAndNotify();
+        mode = Mode.NORMAL;
+        deathTicksRemaining = -1;
+        corpseIntegrity = -1f;
+        corpseBloodDripCounter = 0;
+    }
+
     public int getNetworkRagdollId() {
         return networkRagdollId;
     }
@@ -161,6 +216,7 @@ public class PlayerRagdoll {
             return;
 
         createRagdollBodies();
+        applyPendingProjectileImpact(player);
 
         // Freeze player immediately — prevent movement/gravity fighting the ragdoll
         freezePlayer(player);
@@ -179,6 +235,9 @@ public class PlayerRagdoll {
     private void enterDeathRagdollMode() {
         deathTicksRemaining = Config.DEATH_RAGDOLL_DURATION.get() * 20; // seconds → ticks
 
+        corpseIntegrity = (float) Config.DEATH_CORPSE_INTEGRITY.get().doubleValue();
+        corpseBloodDripCounter = 0;
+
         if (ragdollParts.isEmpty()) {
             // Not already ragdolled — create fresh ragdoll bodies
             ServerPlayer player = getPlayerSafe();
@@ -186,14 +245,49 @@ public class PlayerRagdoll {
                 return;
 
             createRagdollBodies();
+            applyPendingProjectileImpact(player);
 
             // Send start packet to all players tracking this entity (and self) so others see the death ragdoll
             RagdollStartPayload payload = new RagdollStartPayload(player.getId(), networkRagdollId, playerUUID,
                     getRagdollTransforms());
             PacketDistributor.sendToPlayersTrackingEntityAndSelf(player, payload);
+
+            // Immediately snap entity to ragdoll position and shrink hitbox
+            applyDeathEntityState(player);
+        } else {
+            // Was already in RAGDOLL mode before death — bodies exist, apply death entity state
+            ServerPlayer player = getPlayerSafe();
+            if (player != null) {
+                resetEntityTorsoSyncThrottle();
+                applyDeathEntityState(player);
+            }
         }
-        // If bodies already exist (was in RAGDOLL mode), just continue — physics keeps
-        // running
+    }
+
+    /**
+     * Moves the dead player entity to the ragdoll torso centre and sets the
+     * SLEEPING pose so that the hitbox (0.2×0.2) no longer floats at the
+     * standing-death position. Called once on death and then every physics tick.
+     * <p>
+     * {@code teleportTo} is throttled: small torso jitter no longer retriggers full
+     * entity reposition every tick ({@linkplain #TORSO_ENTITY_TELEPORT_EPSILON_SQ}),
+     * with a periodic resync every {@value #TORSO_ENTITY_RESYNC_TICKS} ticks so
+     * long-term drift stays bounded.
+     */
+    private void applyDeathEntityState(ServerPlayer player) {
+        if (ragdollParts.isEmpty())
+            return;
+
+        Transform torsoT = new Transform();
+        ragdollParts.get(0).getMotionState().getWorldTransform(torsoT);
+
+        syncEntityXYZToTorsoIfNeeded(player, torsoT.origin.x, torsoT.origin.y, torsoT.origin.z);
+
+        // Shrink hitbox to SLEEPING (0.2 × 0.2) so mobs don't target the standing position
+        if (player.getPose() != Pose.SLEEPING) {
+            player.setPose(Pose.SLEEPING);
+            player.refreshDimensions();
+        }
     }
 
     private void exitRagdollMode() {
@@ -258,6 +352,37 @@ public class PlayerRagdoll {
         player.stopUsingItem();
     }
 
+    /**
+     * Reset torso↔player {@link ServerPlayer#teleportTo} debounce after creating/removing ragdoll
+     * bodies so the next sample always syncs immediately.
+     */
+    private void resetEntityTorsoSyncThrottle() {
+        lastEntityTorsoSyncX = Double.NaN;
+    }
+
+    /** Throttled {@code teleportTo} following the simulated torso rigid body centre. */
+    private void syncEntityXYZToTorsoIfNeeded(ServerPlayer player, double x, double y, double z) {
+        long tick = physicsWorld.getLevel().getGameTime();
+
+        boolean firstSample = Double.isNaN(lastEntityTorsoSyncX);
+        boolean movedEnough = false;
+        if (!firstSample) {
+            double dx = x - lastEntityTorsoSyncX;
+            double dy = y - lastEntityTorsoSyncY;
+            double dz = z - lastEntityTorsoSyncZ;
+            movedEnough = dx * dx + dy * dy + dz * dz > TORSO_ENTITY_TELEPORT_EPSILON_SQ;
+        }
+
+        boolean periodicResync = !firstSample && tick % TORSO_ENTITY_RESYNC_TICKS == 0L;
+
+        if (!firstSample && !movedEnough && !periodicResync) return;
+
+        player.teleportTo(x, y, z);
+        lastEntityTorsoSyncX = x;
+        lastEntityTorsoSyncY = y;
+        lastEntityTorsoSyncZ = z;
+    }
+
     // ======================== TICK / AFTER STEP ========================
 
     public void afterStep() {
@@ -272,40 +397,35 @@ public class PlayerRagdoll {
 
         ServerPlayer player = getPlayerSafe();
         if (player == null) {
-            // Player left — clean up ragdoll silently
+            // Player left (dimension change / disconnect between ticks).
+            // Send end packet so clients remove their ragdoll state, then clean up.
+            try {
+                PacketDistributor.sendToAllPlayers(new RagdollEndPayload(networkRagdollId));
+            } catch (Exception ignored) {}
             cleanupBodiesOnly();
             mode = Mode.NORMAL;
             return;
         }
 
-        // Read ragdoll transforms and send to tracking clients
+        // Read ragdoll transforms and send to tracking clients.
+        // Use game-tick time (deterministic, no wall-clock skew under server lag).
         RagdollTransform[] transforms = getRagdollTransforms();
-        RagdollUpdatePayload payload = new RagdollUpdatePayload(networkRagdollId, System.currentTimeMillis(),
-                transforms);
+        long gameTimeMs = physicsWorld.getLevel().getGameTime() * 50L;
+        RagdollUpdatePayload payload = new RagdollUpdatePayload(networkRagdollId, gameTimeMs, transforms);
         PacketDistributor.sendToPlayersTrackingEntityAndSelf(player, payload);
 
-        // Teleport player to torso position
+        // Teleport player to torso (throttled — {@code teleportTo} is heavyweight on MC server)
         RigidBody torsoBody = ragdollParts.get(0);
         Transform torsoTransform = new Transform();
         torsoBody.getMotionState().getWorldTransform(torsoTransform);
         Vector3f pos = torsoTransform.origin;
-        player.teleportTo(pos.x, pos.y, pos.z);
+        syncEntityXYZToTorsoIfNeeded(player, pos.x, pos.y, pos.z);
 
         // Continuously freeze player during ragdoll — prevents any movement fighting
         freezePlayer(player);
 
         // Clamp velocities to prevent physics explosion
-        for (RigidBody r : ragdollParts) {
-            Vector3f vel = new Vector3f();
-            r.getLinearVelocity(vel);
-            if (vel.y < -80f)
-                vel.y = -80f;
-            float speed = vel.length();
-            if (speed > 90f) {
-                vel.scale(90f / speed);
-            }
-            r.setLinearVelocity(vel);
-        }
+        clampAllLinearVelocities((float) Config.RAGDOLL_MAX_LINEAR_SPEED.get().doubleValue());
 
         applyFluidForces();
         updateLocalWorldCollision();
@@ -329,37 +449,60 @@ public class PlayerRagdoll {
         // Countdown timer
         deathTicksRemaining--;
         if (deathTicksRemaining <= 0) {
-            // Time's up — remove the death ragdoll
-            cleanupBodiesAndNotify();
-            mode = Mode.NORMAL;
+            endDeathCorpseSession();
             return;
         }
 
-        // Send updates to all players in the dimension
+        // Только пока сущность игрока реально «мертва». После принудительного respawn
+        // (другой мод / PlayerList.respawn) UUID совпадает, но игрок уже жив в этом же
+        // или другом измерении — иначе каждый тик телепортировали бы живого к телу трупа
+        // и ломали загрузку чанков / позицию клиента.
+        if (!orphaned) {
+            ServerPlayer dyingPlayer = getPlayerSafe();
+            if (dyingPlayer != null && dyingPlayer.isDeadOrDying()) {
+                applyDeathEntityState(dyingPlayer);
+            }
+        }
+
+        // Send updates to all players in the dimension (game-tick timestamp)
         RagdollTransform[] transforms = getRagdollTransforms();
-        RagdollUpdatePayload payload = new RagdollUpdatePayload(networkRagdollId, System.currentTimeMillis(),
-                transforms);
         ServerLevel level = physicsWorld.getLevel();
+        long gameTimeMs = level.getGameTime() * 50L;
+        RagdollUpdatePayload payload = new RagdollUpdatePayload(networkRagdollId, gameTimeMs, transforms);
         for (ServerPlayer sp : level.players()) {
             PacketDistributor.sendToPlayer(sp, payload);
         }
 
         // Clamp velocities
-        for (RigidBody r : ragdollParts) {
-            Vector3f vel = new Vector3f();
-            r.getLinearVelocity(vel);
-            if (vel.y < -80f)
-                vel.y = -80f;
-            float speed = vel.length();
-            if (speed > 90f) {
-                vel.scale(90f / speed);
-            }
-            r.setLinearVelocity(vel);
-        }
+        clampAllLinearVelocities(getDeathCorpseMaxSpeed());
 
         applyFluidForces();
         updateLocalWorldCollisionFromTorso();
         correctInterpenetrations();
+
+        corpseBloodDripCounter++;
+        if (Config.RAGDOLL_DEATH_CORPSE_BLOOD_DRIP.get()
+                && corpseBloodDripCounter >= Config.RAGDOLL_DEATH_CORPSE_BLOOD_DRIP_INTERVAL.get()) {
+            corpseBloodDripCounter = 0;
+            RagdollPart[] parts = RagdollPart.values();
+            RagdollPart pick = parts[level.random.nextInt(parts.length)];
+            RagdollTransform tr = pickPartTransformForBleed(pick, transforms);
+            if (tr != null) {
+                RagdollCorpseBlood.trySpawnSlowDrip(
+                        level,
+                        new Vec3(tr.position.x, tr.position.y, tr.position.z),
+                        level.random);
+            }
+        }
+    }
+
+    /** Match {@linkplain #corpseBloodDripCounter} pacing with latest physics snapshot array. */
+    @Nullable
+    private static RagdollTransform pickPartTransformForBleed(RagdollPart part, RagdollTransform[] frame) {
+        if (frame == null || part.index >= frame.length)
+            return null;
+        RagdollTransform t = frame[part.index];
+        return t;
     }
 
     /**
@@ -411,16 +554,16 @@ public class PlayerRagdoll {
             return result;
         };
 
-        // --- Torso ---
+        // --- Torso (heaviest: ~40% of body mass) ---
         CollisionShape torsoShape = new BoxShape(new Vector3f(0.25f, 0.4f, 0.15f));
         Transform torsoT = new Transform();
         torsoT.setIdentity();
         torsoT.setRotation(qq);
         torsoT.origin.set(torsoOrigin);
-        RigidBody torsoBody = new RigidBody(makeInfo(8, torsoT, torsoShape));
+        RigidBody torsoBody = new RigidBody(makeInfo(MASS_TORSO, torsoT, torsoShape));
         torsoBody.setLinearVelocity(motion);
         torsoBody.setRestitution(0.0f);
-        torsoBody.setDamping(0.15f, 0.90f);
+        torsoBody.setDamping(LINEAR_DAMPING, ANGULAR_DAMPING);
         torsoBody.setSleepingThresholds(0.1f, 0.1f);
         torsoBody.setCcdMotionThreshold(0.01f);
         torsoBody.setCcdSweptSphereRadius(0.4f);
@@ -434,10 +577,10 @@ public class PlayerRagdoll {
         headT.setIdentity();
         headT.origin.set(headPos);
         headT.setRotation(qq);
-        RigidBody headBody = new RigidBody(makeInfo(4, headT, headShape));
+        RigidBody headBody = new RigidBody(makeInfo(MASS_HEAD, headT, headShape));
         headBody.setLinearVelocity(motion);
         headBody.setCcdMotionThreshold(0.01f);
-        headBody.setDamping(0.15f, 0.90f);
+        headBody.setDamping(LINEAR_DAMPING, ANGULAR_DAMPING);
         headBody.setCcdSweptSphereRadius(0.25f);
         world.addRigidBody(headBody);
         ragdollParts.add(headBody);
@@ -449,10 +592,10 @@ public class PlayerRagdoll {
         lLegT.setIdentity();
         lLegT.origin.set(lLegPos);
         lLegT.setRotation(qq);
-        RigidBody lLegBody = new RigidBody(makeInfo(6, lLegT, legShape));
+        RigidBody lLegBody = new RigidBody(makeInfo(MASS_LEG, lLegT, legShape));
         lLegBody.setLinearVelocity(motion);
         lLegBody.setCcdMotionThreshold(0.01f);
-        lLegBody.setDamping(0.15f, 0.90f);
+        lLegBody.setDamping(LINEAR_DAMPING, ANGULAR_DAMPING);
         lLegBody.setCcdSweptSphereRadius(0.35f);
         world.addRigidBody(lLegBody);
         ragdollParts.add(lLegBody);
@@ -463,10 +606,10 @@ public class PlayerRagdoll {
         rLegT.setIdentity();
         rLegT.origin.set(rLegPos);
         rLegT.setRotation(qq);
-        RigidBody rLegBody = new RigidBody(makeInfo(6, rLegT, legShape));
+        RigidBody rLegBody = new RigidBody(makeInfo(MASS_LEG, rLegT, legShape));
         rLegBody.setLinearVelocity(motion);
         rLegBody.setCcdMotionThreshold(0.01f);
-        rLegBody.setDamping(0.15f, 0.90f);
+        rLegBody.setDamping(LINEAR_DAMPING, ANGULAR_DAMPING);
         rLegBody.setCcdSweptSphereRadius(0.35f);
         world.addRigidBody(rLegBody);
         ragdollParts.add(rLegBody);
@@ -478,10 +621,10 @@ public class PlayerRagdoll {
         lArmT.setIdentity();
         lArmT.origin.set(lArmPos);
         lArmT.setRotation(qq);
-        RigidBody lArmBody = new RigidBody(makeInfo(4, lArmT, armShape));
+        RigidBody lArmBody = new RigidBody(makeInfo(MASS_ARM, lArmT, armShape));
         lArmBody.setLinearVelocity(motion);
         lArmBody.setCcdMotionThreshold(0.01f);
-        lArmBody.setDamping(0.15f, 0.90f);
+        lArmBody.setDamping(LINEAR_DAMPING, ANGULAR_DAMPING);
         lArmBody.setCcdSweptSphereRadius(0.3f);
         world.addRigidBody(lArmBody);
         ragdollParts.add(lArmBody);
@@ -492,16 +635,17 @@ public class PlayerRagdoll {
         rArmT.setIdentity();
         rArmT.origin.set(rArmPos);
         rArmT.setRotation(qq);
-        RigidBody rArmBody = new RigidBody(makeInfo(4, rArmT, armShape));
+        RigidBody rArmBody = new RigidBody(makeInfo(MASS_ARM, rArmT, armShape));
         rArmBody.setLinearVelocity(motion);
         rArmBody.setCcdMotionThreshold(0.01f);
-        rArmBody.setDamping(0.15f, 0.90f);
+        rArmBody.setDamping(LINEAR_DAMPING, ANGULAR_DAMPING);
         rArmBody.setCcdSweptSphereRadius(0.3f);
         world.addRigidBody(rArmBody);
         ragdollParts.add(rArmBody);
 
         createRagdollJoints();
         updateLocalWorldCollision();
+        resetEntityTorsoSyncThrottle();
     }
 
     /**
@@ -513,8 +657,8 @@ public class PlayerRagdoll {
         if (transforms == null || transforms.length < 6)
             return;
 
-        // Part shapes and masses match createRagdollBodies() exactly
-        float[] masses = { 8f, 4f, 6f, 6f, 4f, 4f };
+        // Part shapes and masses must match createRagdollBodies() exactly.
+        float[] masses = { MASS_TORSO, MASS_HEAD, MASS_LEG, MASS_LEG, MASS_ARM, MASS_ARM };
         CollisionShape[] shapes = {
                 new BoxShape(new Vector3f(0.25f, 0.4f, 0.15f)), // torso
                 new BoxShape(new Vector3f(0.2f, 0.2f, 0.2f)), // head
@@ -535,7 +679,7 @@ public class PlayerRagdoll {
             RigidBody body = new RigidBody(makeInfo(masses[i], bodyT, shapes[i]));
             body.setLinearVelocity(new Vector3f(rt.velocity.x, rt.velocity.y, rt.velocity.z));
             body.setRestitution(0.0f);
-            body.setDamping(0.15f, 0.90f);
+            body.setDamping(LINEAR_DAMPING, ANGULAR_DAMPING);
             body.setSleepingThresholds(0.1f, 0.1f);
             body.setCcdMotionThreshold(0.01f);
             body.setCcdSweptSphereRadius(ccdRadii[i]);
@@ -545,6 +689,7 @@ public class PlayerRagdoll {
 
         createRagdollJoints();
         updateLocalWorldCollisionFromTorso();
+        resetEntityTorsoSyncThrottle();
     }
 
     // ======================== JOINTS ========================
@@ -634,9 +779,15 @@ public class PlayerRagdoll {
 
     // ======================== FORCES / IMPULSES ========================
 
-    /** Apply an explosion impulse to all ragdoll parts */
+    /**
+     * Apply an explosion impulse to all ragdoll parts.
+     * Lighter parts receive proportionally more impulse (scaled by inverse mass).
+     */
     public void applyExplosionImpulse(Vec3 explosionPos, float strength) {
-        for (RigidBody body : ragdollParts) {
+        double scale = Config.RAGDOLL_EXPLOSION_IMPULSE_SCALE.get();
+        float cap = (float) Config.RAGDOLL_EXPLOSION_MAX_IMPULSE.get().doubleValue();
+        for (int i = 0; i < ragdollParts.size(); i++) {
+            RigidBody body = ragdollParts.get(i);
             Transform t = new Transform();
             body.getMotionState().getWorldTransform(t);
             Vector3f dir = new Vector3f(
@@ -647,20 +798,83 @@ public class PlayerRagdoll {
             dir.normalize();
 
             float falloff = Mth.clamp(1f - (dist / 6f), 0f, 1f);
-            float impulseMag = strength * falloff * 20f;
+            float massScale = MASS_TORSO / PART_MASSES[i];
+            float impulseMag = (float) (strength * falloff * 7.5 * massScale * scale);
+            if (impulseMag > cap)
+                impulseMag = cap;
             Vector3f impulse = new Vector3f(dir);
             impulse.scale(impulseMag);
+            body.activate(true);
             body.applyCentralImpulse(impulse);
         }
     }
 
-    /** Apply a directional impulse to all parts (e.g. from damage knockback) */
+    /**
+     * Apply a directional knockback impulse (melee/sword/generic).
+     * Lighter parts receive more impulse so arms fly further than the torso.
+     */
     public void applyKnockbackImpulse(Vec3 direction, float strength) {
-        Vector3f impulse = new Vector3f((float) direction.x * strength, (float) direction.y * strength,
-                (float) direction.z * strength);
-        for (RigidBody body : ragdollParts) {
+        float capped = Math.min(strength, (float) Config.RAGDOLL_KNOCKBACK_STRENGTH_CAP.get().doubleValue());
+        for (int i = 0; i < ragdollParts.size(); i++) {
+            RigidBody body = ragdollParts.get(i);
+            float massScale = MASS_TORSO / PART_MASSES[i];
+            float s = capped * massScale;
+            Vector3f impulse = new Vector3f(
+                    (float) direction.x * s,
+                    (float) direction.y * s,
+                    (float) direction.z * s);
             body.activate(true);
             body.applyCentralImpulse(impulse);
+        }
+    }
+    /**
+     * Apply a point impulse from a projectile impact to the nearest body part.
+     *
+     * @param hitPos   world-space hit position (from EntityHitResult)
+     * @param impulse  momentum vector p = mass × velocity (in physics units)
+     */
+    public void applyProjectileImpact(Vec3 hitPos, Vec3 impulse) {
+        if (ragdollParts.isEmpty()) return;
+
+        // Find closest body part to the impact position
+        int closestIdx = 0;
+        float minDist  = Float.MAX_VALUE;
+        for (int i = 0; i < ragdollParts.size(); i++) {
+            Transform t = new Transform();
+            ragdollParts.get(i).getMotionState().getWorldTransform(t);
+            float dx = t.origin.x - (float) hitPos.x;
+            float dy = t.origin.y - (float) hitPos.y;
+            float dz = t.origin.z - (float) hitPos.z;
+            float d  = dx * dx + dy * dy + dz * dz;
+            if (d < minDist) { minDist = d; closestIdx = i; }
+        }
+
+        RigidBody target = ragdollParts.get(closestIdx);
+        Vector3f imp = new Vector3f((float) impulse.x, (float) impulse.y, (float) impulse.z);
+
+        // Scale impulse by inverse mass so lighter parts react more violently.
+        float massScale = MASS_TORSO / PART_MASSES[closestIdx];
+        imp.scale(massScale);
+
+        target.activate(true);
+        // Point-of-impact torque: offset of hit relative to body centre → spin
+        Transform bodyT = new Transform();
+        target.getMotionState().getWorldTransform(bodyT);
+        Vector3f rel = new Vector3f(
+                (float) hitPos.x - bodyT.origin.x,
+                (float) hitPos.y - bodyT.origin.y,
+                (float) hitPos.z - bodyT.origin.z);
+        target.applyImpulse(imp, rel);
+
+        // Spread ~30 % to neighboring parts for a more natural chain reaction
+        float spillFrac = 0.3f;
+        for (int i = 0; i < ragdollParts.size(); i++) {
+            if (i == closestIdx) continue;
+            float neighborScale = (MASS_TORSO / PART_MASSES[i]) * spillFrac;
+            Vector3f spill = new Vector3f((float) impulse.x, (float) impulse.y, (float) impulse.z);
+            spill.scale(neighborScale);
+            ragdollParts.get(i).activate(true);
+            ragdollParts.get(i).applyCentralImpulse(spill);
         }
     }
 
@@ -687,6 +901,23 @@ public class PlayerRagdoll {
         if (part.index < ragdollParts.size()) {
             Vector3f impulse = new Vector3f((float) vel.x, (float) vel.y, (float) vel.z);
             ragdollParts.get(part.index).applyCentralImpulse(impulse);
+        }
+    }
+
+    private float getDeathCorpseMaxSpeed() {
+        return (float) Config.RAGDOLL_DEATH_CORPSE_MAX_LINEAR_SPEED.get().doubleValue();
+    }
+
+    private void clampAllLinearVelocities(float maxSpeed) {
+        if (ragdollParts.isEmpty())
+            return;
+        for (RigidBody r : ragdollParts) {
+            Vector3f vel = new Vector3f();
+            r.getLinearVelocity(vel);
+            float speed = vel.length();
+            if (speed > maxSpeed && speed > 1e-4f)
+                vel.scale(maxSpeed / speed);
+            r.setLinearVelocity(vel);
         }
     }
 
@@ -730,33 +961,63 @@ public class PlayerRagdoll {
     // ======================== WORLD COLLISION ========================
 
     public void updateLocalWorldCollision() {
-        ServerPlayer player = getPlayerSafe();
-        if (player == null)
+        if (ragdollParts.isEmpty())
             return;
+        rebuildLocalStaticBlockCollision(physicsWorld.getLevel(), torsoBlockCenter());
+    }
 
-        BlockPos center = player.getOnPos();
-        // Only rebuild if player moved significantly (performance optimization)
-        if (center.distManhattan(lastCollisionCenter) < 2)
+    /** Block centre enclosing the torso rigid body — consistent for live ragdoll + death corpse. */
+    private BlockPos torsoBlockCenter() {
+        Transform torsoT = new Transform();
+        ragdollParts.get(0).getMotionState().getWorldTransform(torsoT);
+        return BlockPos.containing(torsoT.origin.x, torsoT.origin.y, torsoT.origin.z);
+    }
+
+    private void updateLocalWorldCollisionFromTorso() {
+        if (ragdollParts.isEmpty())
             return;
-        lastCollisionCenter = center;
+        rebuildLocalStaticBlockCollision(physicsWorld.getLevel(), torsoBlockCenter());
+    }
 
-        // Clean up previous
+    /** Re-scan a 7×7×7 box of block AABBs into Bullet static Rigids if throttle allows. */
+    private void rebuildLocalStaticBlockCollision(Level level, BlockPos center) {
+        long gameTick = physicsWorld.getLevel().getGameTime();
+
+        int mdist =
+                Math.abs(center.getX() - lastCollisionCenter.getX())
+                + Math.abs(center.getY() - lastCollisionCenter.getY())
+                + Math.abs(center.getZ() - lastCollisionCenter.getZ());
+
+        boolean neverBuiltYet = lastCollisionRebuildGameTick < 0;
+        boolean movedFar = mdist >= COLLISION_CENTER_MANHATTAN_THRESHOLD;
+
+        // Small movements (< threshold): throttle full rebuild frequency; drift ≥ 2 Manhattan
+        // triggers a refresh once the cooldown has elapsed — catches slow sliding ragdolls.
+        if (!neverBuiltYet && !movedFar) {
+            long elapsed = gameTick - lastCollisionRebuildGameTick;
+            if (elapsed < COLLISION_REBUILD_MIN_INTERVAL_TICKS || mdist < 2)
+                return;
+        }
+
+        lastCollisionCenter      = center;
+        lastCollisionRebuildGameTick = gameTick;
+
         for (CollisionObject c : localStaticCollision)
             world.removeCollisionObject(c);
         localStaticCollision.clear();
 
-        int radius = 3;
+        int radius = COLLISION_CUBE_HALF_EXTENT_BLOCKS;
         for (int dx = -radius; dx <= radius; dx++)
             for (int dy = -radius; dy <= radius; dy++)
                 for (int dz = -radius; dz <= radius; dz++) {
                     BlockPos bpos = center.offset(dx, dy, dz);
-                    BlockState state = player.level().getBlockState(bpos);
+                    BlockState state = level.getBlockState(bpos);
                     if (state.isAir() || state.getFluidState().isSource())
                         continue;
-                    if (isCompletelySurrounded(bpos, player.level()))
+                    if (isCompletelySurrounded(bpos, level))
                         continue;
 
-                    VoxelShape shape = state.getCollisionShape(player.level(), bpos);
+                    VoxelShape shape = state.getCollisionShape(level, bpos);
                     if (shape.isEmpty())
                         continue;
 
@@ -798,70 +1059,35 @@ public class PlayerRagdoll {
     }
 
     /**
-     * World collision update for death ragdolls — uses torso position instead of
-     * player.
+     * Correct deep penetrations involving <strong>only this ragdoll's</strong> rigid bodies.
+     * The shared Bullet dispatcher retains manifolds for every simulated object in this
+     * dimension {@linkplain PhysicsWorld} — iterating all contacts was O(world contacts)
+     * and could move unrelated bodies.
+     *
+     * <p>Instrumentation / profiling hotspots (Spark, JFR, async profiler): correlate lock time
+     * with stack samples for {@link DiscreteDynamicsWorld#stepSimulation(float, int, float)},
+     * {@link CollisionDispatcher#getInternalManifoldPointer()}, calls into
+     * {@link #rebuildLocalStaticBlockCollision} and repeated {@link ServerPlayer#teleportTo}.
      */
-    private void updateLocalWorldCollisionFromTorso() {
-        if (ragdollParts.isEmpty())
-            return;
-        Level level = physicsWorld.getLevel();
-
-        Transform torsoT = new Transform();
-        ragdollParts.get(0).getMotionState().getWorldTransform(torsoT);
-        BlockPos center = BlockPos.containing(torsoT.origin.x, torsoT.origin.y, torsoT.origin.z);
-
-        if (center.distManhattan(lastCollisionCenter) < 2)
-            return;
-        lastCollisionCenter = center;
-
-        for (CollisionObject c : localStaticCollision)
-            world.removeCollisionObject(c);
-        localStaticCollision.clear();
-
-        int radius = 3;
-        for (int dx = -radius; dx <= radius; dx++)
-            for (int dy = -radius; dy <= radius; dy++)
-                for (int dz = -radius; dz <= radius; dz++) {
-                    BlockPos bpos = center.offset(dx, dy, dz);
-                    BlockState state = level.getBlockState(bpos);
-                    if (state.isAir() || state.getFluidState().isSource())
-                        continue;
-                    if (isCompletelySurrounded(bpos, level))
-                        continue;
-
-                    VoxelShape shape = state.getCollisionShape(level, bpos);
-                    if (shape.isEmpty())
-                        continue;
-
-                    for (AABB box : shape.toAabbs()) {
-                        Vector3f halfExtents = new Vector3f(
-                                (float) (box.getXsize() / 2),
-                                (float) (box.getYsize() / 2),
-                                (float) (box.getZsize() / 2));
-                        CollisionShape cs = new BoxShape(halfExtents);
-
-                        Transform t = new Transform();
-                        t.setIdentity();
-                        t.origin.set(
-                                (float) (bpos.getX() + box.minX + box.getXsize() / 2),
-                                (float) (bpos.getY() + box.minY + box.getYsize() / 2),
-                                (float) (bpos.getZ() + box.minZ + box.getZsize() / 2));
-
-                        RigidBody rb = new RigidBody(
-                                new RigidBodyConstructionInfo(0f, new DefaultMotionState(t), cs, new Vector3f()));
-                        rb.setCollisionFlags(rb.getCollisionFlags() | CollisionFlags.STATIC_OBJECT);
-                        world.addRigidBody(rb);
-                        localStaticCollision.add(rb);
-                    }
-                }
-    }
-
-    // ======================== INTERPENETRATION CORRECTION ========================
-
     private void correctInterpenetrations() {
+        Level lvl = physicsWorld.getLevel();
+
+        /* Shared Bullet dispatcher holds manifolds for <i>every</i> ragdoll + stray body in the
+           dimension — only touch contacts involving OUR parts. Alternate ticks globally. */
+        if ((lvl.getGameTime() & 1L) != 0L) return;
+
+        int fixesApplied = 0;
+
+        manifoldLoop:
         for (PersistentManifold manifold : physicsWorld.getDispatcher().getInternalManifoldPointer()) {
             if (manifold == null)
                 continue;
+
+            CollisionObject co0 = (CollisionObject) manifold.getBody0();
+            CollisionObject co1 = (CollisionObject) manifold.getBody1();
+            boolean touchesThis = ragdollParts.contains(co0) || ragdollParts.contains(co1);
+            if (!touchesThis) continue;
+
             int numContacts = manifold.getNumContacts();
             for (int i = 0; i < numContacts; i++) {
                 ManifoldPoint point = manifold.getContactPoint(i);
@@ -873,11 +1099,12 @@ public class PlayerRagdoll {
                     float correction = Math.min(0.3f, 2.0f * -point.getDistance());
                     Vector3f normal = new Vector3f(point.normalWorldOnB);
                     normal.scale(correction);
-                    if (a.getInvMass() > 0)
-                        a.translate(normal);
+                    if (a.getInvMass() > 0) a.translate(normal);
                     normal.scale(-1);
-                    if (b.getInvMass() > 0)
-                        b.translate(normal);
+                    if (b.getInvMass() > 0) b.translate(normal);
+
+                    if (++fixesApplied >= INTERPENETRATION_MAX_FIXES_PER_RAGDOLL_PER_TICK)
+                        break manifoldLoop;
                 }
             }
         }
@@ -929,6 +1156,18 @@ public class PlayerRagdoll {
     }
 
     /**
+     * Check the projectile-impact cache for this player and apply the stored impact
+     * to the freshly-created ragdoll bodies. Called immediately after
+     * {@link #createRagdollBodies()}.
+     */
+    private void applyPendingProjectileImpact(ServerPlayer player) {
+        DamageEventHandler.PendingImpact impact = DamageEventHandler.pollImpact(player.getUUID());
+        if (impact != null) {
+            applyProjectileImpact(impact.hitPos(), impact.impulse());
+        }
+    }
+
+    /**
      * Full cleanup — removes physics bodies AND sends RagdollEndPayload if ragdoll
      * was active.
      * Call this when removing the ragdoll entirely (player disconnect, dimension
@@ -969,7 +1208,51 @@ public class PlayerRagdoll {
         ragdollJoints.clear();
         ragdollParts.clear();
         localStaticCollision.clear();
+        lastCollisionCenter           = BlockPos.ZERO;
+        lastCollisionRebuildGameTick  = -1;
+        corpseIntegrity               = -1f;
+        corpseBloodDripCounter        = 0;
+        resetEntityTorsoSyncThrottle();
     }
+
+    /** Half-size of collision cube (in blocks); total volume spans {@code [-n..+n]^3 inclusive}. */
+    private static final int COLLISION_CUBE_HALF_EXTENT_BLOCKS = 3;
+
+    /** Manhattan torso movement that forces an immediate static-mesh rebuild. */
+    private static final int COLLISION_CENTER_MANHATTAN_THRESHOLD = 5;
+
+    /**
+     * Minimum ticks between collisions mesh rebuild when the torso has not crossed
+     * {@linkplain #COLLISION_CENTER_MANHATTAN_THRESHOLD}.
+     */
+    private static final long COLLISION_REBUILD_MIN_INTERVAL_TICKS = 6;
+
+    /**
+     * Maximum contact corrections per ragdoll per tick (dispatcher stores manifolds for the
+     * whole dimension-level physics world).
+     */
+    private static final int INTERPENETRATION_MAX_FIXES_PER_RAGDOLL_PER_TICK = 40;
+
+    /** Squared distance so micro physics jitter skips {@link ServerPlayer#teleportTo}. */
+    private static final double TORSO_ENTITY_TELEPORT_EPSILON_SQ = 0.065 * 0.065;
+
+    /** Periodic resync even below epsilon so eventual drift / anti-cheat state stays sane. */
+    private static final int TORSO_ENTITY_RESYNC_TICKS = 5;
+
+    // ======================== BODY MASS / DAMPING CONSTANTS ========================
+    // Realistic relative masses (sum ≈ 32 kg-equivalent).
+    // Torso is the heaviest single segment; arms are lightest (fly furthest on hit).
+    private static final float MASS_TORSO = 16f;
+    private static final float MASS_HEAD  =  3f;
+    private static final float MASS_LEG   =  5.5f;
+    private static final float MASS_ARM   =  2.5f;
+    /** Per-part mass array indexed by RagdollPart.index. */
+    static final float[] PART_MASSES = { MASS_TORSO, MASS_HEAD, MASS_LEG, MASS_LEG, MASS_ARM, MASS_ARM };
+
+    // Lower linear damping → more realistic airborne momentum.
+    // Higher angular damping → slower spin to avoid dizzying tumbles.
+    private static final float LINEAR_DAMPING  = 0.05f;
+    private static final float ANGULAR_DAMPING = 0.80f;
 
     private RigidBodyConstructionInfo makeInfo(float mass, Transform startTransform, CollisionShape shape) {
         Vector3f inertia = new Vector3f();
@@ -978,10 +1261,10 @@ public class PlayerRagdoll {
         }
         DefaultMotionState motionState = new DefaultMotionState(startTransform);
         RigidBodyConstructionInfo info = new RigidBodyConstructionInfo(mass, motionState, shape, inertia);
-        info.linearDamping = 0.15f;
-        info.angularDamping = 0.90f;
-        info.restitution = 0.0f;
-        info.friction = 1.2f;
+        info.linearDamping  = LINEAR_DAMPING;
+        info.angularDamping = ANGULAR_DAMPING;
+        info.restitution    = 0.0f;
+        info.friction       = 1.2f;
         info.additionalDamping = true;
         return info;
     }

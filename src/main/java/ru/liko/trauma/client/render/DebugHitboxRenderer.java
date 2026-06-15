@@ -50,7 +50,7 @@ public class DebugHitboxRenderer {
 
         double totalHeight = height;
 
-        // --- MATH REPLICATING HitZoneCalculator ---
+        // Три зоны по высоте (голова / торс / ноги) для отладки при F3+B.
         boolean isCrouching = entity.isCrouching();
         double headThreshold = isCrouching ? 0.75 : 0.80;
         double torsoThreshold = isCrouching ? 0.40 : 0.45;
